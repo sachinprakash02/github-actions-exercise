@@ -1,1 +1,8 @@
-
+name: Deployment Echo
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Simple Echo
+        uses: echo "Hello"
