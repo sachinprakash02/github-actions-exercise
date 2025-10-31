@@ -1,98 +1,75 @@
-# src/tools/document_loader.py
-from docling.document_converter import DocumentConverter
+# src/tools/html_preprocessor.py
+from bs4 import BeautifulSoup
 import re
 
-class DoclingLoader:
+class HTMLPreprocessor:
     """
-    Loader for Docling v2.58+ with table extraction support.
-    Extracts text, headings, and tables with metadata.
+    Preprocesses HTML exported from Docling into structured text chunks
+    with section, subsection, and block-type metadata.
     """
 
-    def __init__(self):
-        self.converter = DocumentConverter()
+    def __init__(self, min_chunk_len: int = 50):
+        self.min_chunk_len = min_chunk_len
 
-    def load_markdown(self, file_path: str) -> str:
+    def preprocess(self, html: str):
+        soup = BeautifulSoup(html, "html.parser")
+        chunks = []
+        current_section = None
+        current_subsection = None
+
+        # Remove non-textual or noisy elements
+        for tag in soup(["script", "style", "footer", "header", "nav", "img", "svg"]):
+            tag.decompose()
+
+        # Clean excessive newlines and whitespace
+        def clean_text(t: str):
+            t = re.sub(r"\s+", " ", t).strip()
+            return t
+
+        for elem in soup.find_all(["h1", "h2", "h3", "p", "ul", "ol", "table", "caption"]):
+            tag = elem.name
+            text = clean_text(elem.get_text(" "))
+
+            if not text or len(text) < self.min_chunk_len:
+                continue
+
+            # Track section hierarchy
+            if tag == "h1":
+                current_section = text
+                current_subsection = None
+                continue
+            elif tag == "h2":
+                current_subsection = text
+                continue
+
+            # Handle tables
+            if tag == "table":
+                table_text = self._table_to_text(elem)
+                chunks.append({
+                    "text": f"[TABLE]\n{table_text}\n[/TABLE]",
+                    "section": current_section,
+                    "subsection": current_subsection,
+                    "block_type": "table",
+                })
+                continue
+
+            # Regular paragraph or list
+            chunks.append({
+                "text": text,
+                "section": current_section,
+                "subsection": current_subsection,
+                "block_type": tag,
+            })
+
+        return chunks
+
+    def _table_to_text(self, table_elem):
         """
-        Converts document to Markdown for inspection.
+        Convert <table> → readable text form.
         """
-        result = self.converter.convert(file_path)
-        md = result.export_to_markdown()
-        md = md.replace("<!-- image -->", "")
-        md = re.sub(r"\n{3,}", "\n\n", md)
-        return md
-
-    def load_with_metadata(self, file_path: str):
-        """
-        Returns list of dicts: each with text, section, subsection, page, and source info.
-        Includes flattened tables as readable text.
-        """
-        result = self.converter.convert(file_path)
-        pages = getattr(result, "pages", [])
-        structured_chunks = []
-        current_section, current_subsection = None, None
-
-        for page in pages:
-            page_num = getattr(page, "page_number", None)
-            for block in getattr(page, "blocks", []):
-                btype = getattr(block, "type", "").lower()
-                text = getattr(block, "text", "").strip()
-
-                # ---- Handle headings ----
-                if btype == "heading":
-                    level = getattr(block, "level", None)
-                    if level == 1:
-                        current_section = text
-                        current_subsection = None
-                    elif level == 2:
-                        current_subsection = text
-                    continue
-
-                # ---- Handle regular text ----
-                if btype in ("paragraph", "list", "quote") and text:
-                    structured_chunks.append({
-                        "text": text,
-                        "section": current_section,
-                        "subsection": current_subsection,
-                        "page": page_num,
-                        "block_type": btype
-                    })
-
-                # ---- Handle tables ----
-                elif btype == "table":
-                    table_text = self._process_table_block(block)
-                    if table_text:
-                        structured_chunks.append({
-                            "text": table_text,
-                            "section": current_section,
-                            "subsection": current_subsection,
-                            "page": page_num,
-                            "block_type": "table"
-                        })
-
-        if not structured_chunks:
-            print("⚠️ No text or tables extracted. Ensure the PDF is selectable.")
-        return structured_chunks
-
-    def _process_table_block(self, block):
-        """
-        Converts a Docling table block into readable text for embeddings.
-        """
-        # Some blocks provide pre-rendered text
-        if getattr(block, "text", None):
-            return f"[TABLE]\n{block.text.strip()}\n[/TABLE]"
-
-        # Try to parse structured table data (if available)
-        table_data = getattr(block, "table_data", None)
-        if not table_data:
-            return None
-
         rows = []
-        for row in table_data:
-            cells = [str(cell).strip() for cell in row if cell]
-            rows.append(" | ".join(cells))
-        table_text = "\n".join(rows)
-
-        caption = getattr(block, "caption", "")
-        if caption:
-            caption = caption.strip()
-        return f"[TABLE] {caption}\n{table_text}\n[/TABLE]"
+        for tr in table_elem.find_all("tr"):
+            cells = [re.sub(r"\s+", " ", c.get_text(" ").strip()) for c in tr.find_all(["th", "td"])]
+            if cells:
+                rows.append(" | ".join(cells))
+        return "\n".join(rows)
