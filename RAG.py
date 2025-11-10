@@ -1,100 +1,72 @@
-# src/tools/html_preprocessor.py
-from bs4 import BeautifulSoup
-import re
-import json
+import pandas as pd
+import os
+import logging
+from typing import List, Dict, Any, Tuple
 
-class HTMLPreprocessor:
-    """
-    Enhanced HTML preprocessor for Docling-exported HTML.
-    Extracts structured text + tables efficiently with JSON metadata.
-    """
+logger = logging.getLogger(__name__)
 
-    def __init__(self, min_chunk_len: int = 50):
-        self.min_chunk_len = min_chunk_len
+class ExcelRAGIngestor:
+    def __init__(self, vectorstore=None):
+        self.vectorstore = vectorstore
 
-    def preprocess(self, html: str):
-        soup = BeautifulSoup(html, "html.parser")
-        chunks = []
-        current_section = None
-        current_subsection = None
+    def _row_to_chunk(self, row: pd.Series, usecase: str, source_file: str) -> Tuple[str, Dict[str, Any]]:
+        """Convert one Excel row to a (text, metadata) pair."""
+        object_name = str(row.get("Object", "")).strip()
+        attribute = str(row.get("Attribute", "")).strip()
+        full_xpath = str(row.get("Full XPath", row.get("FullXpath", ""))).strip()
+        allowed = str(row.get("Allowed Values", "")).strip()
+        notes = str(row.get("Notes", "")).strip()
+        mod = str(row.get("Mod", "")).strip()
+        sup = str(row.get("Sup", "")).strip()
+        src = str(row.get("Source", "")).strip()
 
-        for tag in soup(["script", "style", "footer", "header", "nav", "img", "svg"]):
-            tag.decompose()
+        text_block = f"""[Usecase: {usecase}]
+[Object: {object_name}]
+Attribute: {attribute}
+Full XPath: {full_xpath}
+Allowed Values: {allowed}
+Mode: {mod}
+Support: {sup}
+Notes: {notes}
+Source: {src}
+"""
 
-        def clean_text(t: str):
-            return re.sub(r"\s+", " ", t or "").strip()
+        metadata = {
+            "usecase": usecase,
+            "object": object_name,
+            "attribute": attribute,
+            "xpath": full_xpath,
+            "allowed_values": allowed,
+            "mode": mod,
+            "support": sup,
+            "notes": notes,
+            "source": src,
+            "sheet": usecase,
+            "file": os.path.basename(source_file)
+        }
+        return text_block.strip(), metadata
 
-        for elem in soup.find_all(["h1", "h2", "h3", "p", "ul", "ol", "table", "caption"]):
-            tag = elem.name
-            text = clean_text(elem.get_text(" "))
+    def ingest_excel(self, file_path: str, batch_size: int = 200):
+        logger.info("Reading Excel workbook %s", file_path)
+        xls = pd.ExcelFile(file_path)
+        all_texts, all_metas = [], []
 
-            if not text or len(text) < self.min_chunk_len:
-                continue
+        for sheet in xls.sheet_names:
+            df = pd.read_excel(xls, sheet_name=sheet)
+            df = df.dropna(how="all")
+            logger.info("Processing sheet %s (%d rows)", sheet, len(df))
+            for _, row in df.iterrows():
+                text, meta = self._row_to_chunk(row, sheet, file_path)
+                all_texts.append(text)
+                all_metas.append(meta)
 
-            if tag == "h1":
-                current_section = text
-                current_subsection = None
-                continue
-            elif tag == "h2":
-                current_subsection = text
-                continue
+        logger.info("Prepared %d total chunks for ingestion", len(all_texts))
 
-            # Handle tables separately
-            if tag == "table":
-                table_summary, table_json = self._process_table_block(elem)
-                if table_summary:
-                    chunks.append({
-                        "text": f"[TABLE] {table_summary} [/TABLE]",
-                        "section": current_section,
-                        "subsection": current_subsection,
-                        "block_type": "table",
-                        "table_json": table_json
-                    })
-                continue
+        if self.vectorstore:
+            for i in range(0, len(all_texts), batch_size):
+                batch_t = all_texts[i:i+batch_size]
+                batch_m = all_metas[i:i+batch_size]
+                self.vectorstore.add_texts(batch_t, metadatas=batch_m)
+            logger.info("Ingestion into vectorstore complete")
 
-            chunks.append({
-                "text": text,
-                "section": current_section,
-                "subsection": current_subsection,
-                "block_type": tag,
-            })
-
-        return chunks
-
-    def _process_table_block(self, table_elem):
-        """
-        Extracts structured tabular data and returns both:
-        1. A readable summary for embeddings
-        2. A structured JSON version for metadata
-        """
-        rows = []
-        headers = []
-        for tr in table_elem.find_all("tr"):
-            cells = [re.sub(r"\s+", " ", c.get_text(" ").strip()) for c in tr.find_all(["th", "td"])]
-            if not cells:
-                continue
-            if not headers:
-                headers = cells
-            else:
-                rows.append(cells)
-
-        if not headers and not rows:
-            return None, None
-
-        # --- Build structured table JSON ---
-        table_json = {"headers": headers, "rows": rows}
-        table_json_str = json.dumps(table_json, ensure_ascii=False)
-
-        # --- Build a short summary string for embedding ---
-        # Try to build key-value representation for first few rows
-        summary_lines = []
-        max_rows = min(5, len(rows))  # limit summary to first 5 rows
-        for row in rows[:max_rows]:
-            if len(row) == len(headers):
-                kv_pairs = ", ".join(f"{h}: {v}" for h, v in zip(headers, row))
-                summary_lines.append(kv_pairs)
-            else:
-                summary_lines.append(" | ".join(row))
-        table_summary = " | ".join(headers) + "\n" + "\n".join(summary_lines)
-
-        return table_summary, table_json_str
+        return all_texts, all_metas
